@@ -1191,16 +1191,36 @@ impl FakeExecutor {
             struct_constructors,
         )?;
         let storage = TraversalStorage::new();
-        session
-            .execute_entry_function(
-                entry_fn.module(),
-                entry_fn.function(),
-                entry_fn.ty_args().to_vec(),
-                args,
-                &mut gas_meter,
-                &mut TraversalContext::new(&storage),
-            )
-            .map_err(|e| e.into_vm_status())?;
+        if gas_params_res.is_ok() && storage_gas_params.is_ok() {
+            session
+                .execute_entry_function(
+                    entry_fn.module(),
+                    entry_fn.function(),
+                    entry_fn.ty_args().to_vec(),
+                    args,
+                    &mut MemoryTrackedGasMeter::new(StandardGasMeter::new(
+                        StandardGasAlgebra::new(
+                            gas_feature_version,
+                            gas_params_res.unwrap().clone().vm,
+                            storage_gas_params.unwrap(),
+                            10000000000000,
+                        ),
+                    )),
+                    &mut TraversalContext::new(&storage),
+                )
+                .map_err(|e| e.into_vm_status())?;
+        } else {
+            session
+                .execute_entry_function(
+                    entry_fn.module(),
+                    entry_fn.function(),
+                    entry_fn.ty_args().to_vec(),
+                    args,
+                    &mut UnmeteredGasMeter,
+                    &mut TraversalContext::new(&storage),
+                )
+                .map_err(|e| e.into_vm_status())?;
+        }
 
         let mut change_set = session
             .finish(&ChangeSetConfigs::unlimited_at_gas_feature_version(
