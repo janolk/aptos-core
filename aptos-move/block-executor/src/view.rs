@@ -486,10 +486,14 @@ impl<'a, T: Transaction, X: Executable> ParallelState<'a, T, X> {
         }
 
         loop {
+            let size_changed = self.versioned_map.group_data().size_changed(group_key);
+
+            // If size_changed, execution will wait on estimates (since there is more
+            // likelihood that size may change from recorded estimates).
             match self
                 .versioned_map
                 .group_data()
-                .get_group_size(group_key, txn_idx)
+                .get_group_size(group_key, txn_idx, size_changed)
             {
                 Ok(group_size) => {
                     assert_ok!(

@@ -15,7 +15,7 @@ use serde::Serialize;
 use std::{
     collections::{
         btree_map::{self, BTreeMap},
-        HashMap, HashSet,
+        HashMap,
     },
     fmt::Debug,
     hash::Hash,
@@ -62,6 +62,9 @@ pub(crate) struct VersionedGroupValue<T, V> {
 
     /// Group contents corresponding to the latest committed version.
     committed_group: HashMap<T, ValueWithLayout<V>>,
+
+    /// Size changed.
+    size_changed: bool,
 }
 
 /// Maps each key (access path) to an internal VersionedValue.
@@ -77,6 +80,7 @@ impl<T: Hash + Clone + Debug + Eq + Serialize, V: TransactionWrite> Default
             versioned_map: HashMap::new(),
             idx_to_update: BTreeMap::new(),
             committed_group: HashMap::new(),
+            size_changed: false,
         }
     }
 }
@@ -170,13 +174,21 @@ impl<T: Hash + Clone + Debug + Eq + Serialize, V: TransactionWrite> VersionedGro
         let at_base_version = shifted_idx == zero_idx;
 
         // Remove any prior entries.
-        let prev_tags: HashSet<T> = self.remove(shifted_idx.clone()).into_iter().collect();
-        let mut writes_outside = false;
+        let mut prev_tag_and_sizes: HashMap<T, Option<usize>> =
+            self.remove(shifted_idx.clone()).into_iter().collect();
+
+        // Either writes outside of updates the size of an entry from what
+        // would have been marked an estimate.
+        // Note: we can flag if an estimate entry's size was used, and only then check.
+        let mut changes_behavior = false;
 
         let arc_map = values
             .map(|(tag, v)| {
-                if !prev_tags.contains(&tag) {
-                    writes_outside = true;
+                if match prev_tag_and_sizes.remove(&tag) {
+                    Some(prev_size) => v.bytes_len() != prev_size,
+                    None => true,
+                } {
+                    changes_behavior = true;
                 }
 
                 // Update versioned_map.
@@ -188,6 +200,10 @@ impl<T: Hash + Clone + Debug + Eq + Serialize, V: TransactionWrite> VersionedGro
                 (tag, v)
             })
             .collect();
+
+        if !prev_tag_and_sizes.is_empty() {
+            changes_behavior = true;
+        }
 
         assert_none!(
             self.idx_to_update
@@ -201,7 +217,15 @@ impl<T: Hash + Clone + Debug + Eq + Serialize, V: TransactionWrite> VersionedGro
                 .expect("Marking storage version as committed must succeed");
         }
 
-        writes_outside
+        if changes_behavior {
+            self.size_changed = true;
+        }
+
+        changes_behavior
+    }
+
+    fn size_changed(&self) -> bool {
+        self.size_changed
     }
 
     fn mark_estimate(&mut self, txn_idx: TxnIndex) {
@@ -224,15 +248,20 @@ impl<T: Hash + Clone + Debug + Eq + Serialize, V: TransactionWrite> VersionedGro
         }
     }
 
-    fn remove(&mut self, shifted_idx: ShiftedTxnIndex) -> Vec<T> {
+    fn remove(&mut self, shifted_idx: ShiftedTxnIndex) -> Vec<(T, Option<usize>)> {
         // Remove idx updates first, then entries.
-        let idx_update_tags: Vec<T> = self
+        let idx_update_tags: Vec<(T, Option<usize>)> = self
             .idx_to_update
             .remove(&shifted_idx)
-            .map_or(vec![], |map| map.into_inner().into_keys().collect());
+            .map_or(vec![], |map| {
+                map.into_inner()
+                    .into_iter()
+                    .map(|(k, v)| (k, v.bytes_len()))
+                    .collect()
+            });
 
         // Similar to mark_estimate, need to remove an individual entry for each tag.
-        for tag in idx_update_tags.iter() {
+        for (tag, _) in idx_update_tags.iter() {
             assert_some!(
                 self.versioned_map
                     .get_mut(tag)
@@ -333,7 +362,11 @@ impl<T: Hash + Clone + Debug + Eq + Serialize, V: TransactionWrite> VersionedGro
             })
     }
 
-    fn get_latest_group_size(&self, txn_idx: TxnIndex) -> Result<ResourceGroupSize, MVGroupError> {
+    fn get_latest_group_size(
+        &self,
+        txn_idx: TxnIndex,
+        depend_on_estimate: bool,
+    ) -> Result<ResourceGroupSize, MVGroupError> {
         if !self
             .idx_to_update
             .contains_key(&ShiftedTxnIndex::zero_idx())
@@ -347,12 +380,17 @@ impl<T: Hash + Clone + Debug + Eq + Serialize, V: TransactionWrite> VersionedGro
             .flat_map(|(tag, tree)| {
                 tree.range(ShiftedTxnIndex::zero_idx()..ShiftedTxnIndex::new(txn_idx))
                     .next_back()
-                    .and_then(|(_idx, entry)| {
-                        // Even if entry is estimate, size doesn't need to cause conflict (unless we want to track separately size vs no size estimates)
-                        entry
-                            .value
-                            .bytes_len()
-                            .map(|bytes_len| Ok((tag, bytes_len)))
+                    .and_then(|(idx, entry)| {
+                        if entry.flag == Flag::Estimate && depend_on_estimate {
+                            Some(Err(MVGroupError::Dependency(
+                                idx.idx().expect("May not depend on storage version"),
+                            )))
+                        } else {
+                            entry
+                                .value
+                                .bytes_len()
+                                .map(|bytes_len| Ok((tag, bytes_len)))
+                        }
                     })
             })
             .collect::<Result<Vec<_>, MVGroupError>>()?;
@@ -431,6 +469,14 @@ impl<
             .remove(ShiftedTxnIndex::new(txn_idx));
     }
 
+    /// Size has changed at 'key'. Useful to know for e.g. determining the behavior of
+    /// size read
+    pub fn size_changed(&self, key: &K) -> bool {
+        self.group_values
+            .get_mut(key)
+            .map_or(false, |entry| entry.size_changed())
+    }
+
     /// Read the latest value corresponding to a tag at a given group (identified by key).
     /// Return the size of the group (if requested), as defined above, alongside the version
     /// information (None if storage/pre-block version).
@@ -453,13 +499,18 @@ impl<
     /// marked as an estimate, a dependency is returned. Note: it would be possible to
     /// process estimated entry sizes, but would have to mark that if after the re-execution
     /// the entry size changes, then re-execution must reduce validation idx.
+    ///
+    /// If depend_on_estimate is false, the size of entry is returned even if the entry
+    /// is marked as estimate, which can help optimistic concurrency (e.g. to avoid
+    /// unnecessary aborts during validation).
     pub fn get_group_size(
         &self,
         key: &K,
         txn_idx: TxnIndex,
+        depend_on_estimate: bool,
     ) -> Result<ResourceGroupSize, MVGroupError> {
         match self.group_values.get(key) {
-            Some(g) => g.get_latest_group_size(txn_idx),
+            Some(g) => g.get_latest_group_size(txn_idx, depend_on_estimate),
             None => Err(MVGroupError::Uninitialized),
         }
     }
