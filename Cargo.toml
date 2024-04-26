@@ -131,6 +131,7 @@ members = [
     "execution/executor-service",
     "execution/executor-test-helpers",
     "execution/executor-types",
+    "experimental/airdrop",
     "experimental/execution/ptx-executor",
     "experimental/runtimes",
     "experimental/storage/layered-map",
