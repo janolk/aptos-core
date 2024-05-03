@@ -1203,7 +1203,7 @@ impl FakeExecutor {
                             gas_feature_version,
                             gas_params_res.unwrap().clone().vm,
                             storage_gas_params.unwrap(),
-                            10000000000000,
+                            100000000,
                         ),
                     )),
                     &mut TraversalContext::new(&storage),
