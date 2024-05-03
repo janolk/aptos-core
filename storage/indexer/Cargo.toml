@@ -23,6 +23,7 @@ aptos-storage-interface = { workspace = true }
 aptos-types = { workspace = true }
 bcs = { workspace = true }
 bytes = { workspace = true }
+byteorder = { workspace = true }
 dashmap = { workspace = true }
 move-core-types = { workspace = true }
 proptest = { workspace = true, optional = true }

@@ -58,6 +58,7 @@ pub fn bootstrap(
             mp_sender,
             node_config,
             table_info_reader,
+            None,
         ));
         let service_context = ServiceContext {
             context: context.clone(),

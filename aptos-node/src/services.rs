@@ -11,10 +11,14 @@ use aptos_consensus::{
 };
 use aptos_consensus_notifications::ConsensusNotifier;
 use aptos_data_client::client::AptosDataClient;
-use aptos_db_indexer::table_info_reader::TableInfoReader;
+use aptos_db_indexer::{
+    db_tailer_reader::IndexerTransactionEventReader, table_info_reader::TableInfoReader,
+};
 use aptos_event_notifications::{DbBackedOnChainConfig, ReconfigNotificationListener};
 use aptos_indexer_grpc_fullnode::runtime::bootstrap as bootstrap_indexer_grpc;
-use aptos_indexer_grpc_table_info::runtime::bootstrap as bootstrap_indexer_table_info;
+use aptos_indexer_grpc_table_info::runtime::{
+    bootstrap as bootstrap_indexer_table_info, bootstrap_db_tailer,
+};
 use aptos_logger::{debug, telemetry_log_writer::TelemetryLog, LoggerFilterUpdater};
 use aptos_mempool::{network::MempoolSyncMsg, MempoolClientRequest, QuorumStoreRequest};
 use aptos_mempool_notifications::MempoolNotificationListener;
@@ -51,6 +55,7 @@ pub fn bootstrap_api_and_indexer(
     Option<Runtime>,
     Option<Runtime>,
     Option<Runtime>,
+    Option<Runtime>,
 )> {
     // Create the mempool client and sender
     let (mempool_client_sender, mempool_client_receiver) =
@@ -66,11 +71,24 @@ pub fn bootstrap_api_and_indexer(
         None => (None, None),
     };
 
+    let (db_tailer_runtime, txn_event_reader) =
+        match bootstrap_db_tailer(node_config, db_rw.clone()) {
+            Some((runtime, db_tailer)) => (Some(runtime), Some(db_tailer)),
+            None => (None, None),
+        };
+
     // Create the API runtime
     let table_info_reader: Option<Arc<dyn TableInfoReader>> = indexer_async_v2.map(|arc| {
         let trait_object: Arc<dyn TableInfoReader> = arc;
         trait_object
     });
+
+    let txn_event_reader: Option<Arc<dyn IndexerTransactionEventReader>> =
+        txn_event_reader.map(|arc| {
+            let trait_object: Arc<dyn IndexerTransactionEventReader> = arc;
+            trait_object
+        });
+
     let api_runtime = if node_config.api.enabled {
         Some(bootstrap_api(
             node_config,
@@ -78,6 +96,7 @@ pub fn bootstrap_api_and_indexer(
             db_rw.reader.clone(),
             mempool_client_sender.clone(),
             table_info_reader.clone(),
+            txn_event_reader.clone(),
         )?)
     } else {
         None
@@ -106,6 +125,7 @@ pub fn bootstrap_api_and_indexer(
         indexer_table_info_runtime,
         indexer_runtime,
         indexer_grpc,
+        db_tailer_runtime,
     ))
 }
 

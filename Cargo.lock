@@ -1159,6 +1159,7 @@ dependencies = [
  "aptos-storage-interface",
  "aptos-types",
  "bcs 0.1.4",
+ "byteorder",
  "bytes",
  "dashmap",
  "move-core-types",
