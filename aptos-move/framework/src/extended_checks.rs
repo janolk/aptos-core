@@ -33,6 +33,7 @@ use std::{
 };
 use thiserror::Error;
 
+const ALLOW_UNSAFE_RANDOMNESS_ATTRIBUTE: &str = "lint_allow_unsafe_randomness";
 const INIT_MODULE_FUN: &str = "init_module";
 const LEGACY_ENTRY_FUN_ATTRIBUTE: &str = "legacy_entry_fun";
 const ERROR_PREFIX: &str = "E";
@@ -44,9 +45,12 @@ const RESOURCE_GROUP_NAME: &str = "group";
 const RESOURCE_GROUP_SCOPE: &str = "scope";
 const VIEW_FUN_ATTRIBUTE: &str = "view";
 
+const RANDOMNESS_MODULE_NAME: &str = "randomness";
+
 // top-level attribute names, only.
 pub fn get_all_attribute_names() -> &'static BTreeSet<String> {
-    const ALL_ATTRIBUTE_NAMES: [&str; 6] = [
+    const ALL_ATTRIBUTE_NAMES: [&str; 7] = [
+        ALLOW_UNSAFE_RANDOMNESS_ATTRIBUTE,
         LEGACY_ENTRY_FUN_ATTRIBUTE,
         RESOURCE_GROUP,
         RESOURCE_GROUP_MEMBER,
@@ -95,6 +99,8 @@ struct ExtendedChecker<'a> {
     output: BTreeMap<ModuleId, RuntimeModuleMetadataV1>,
     /// The id of the module defining error categories
     error_category_module: ModuleId,
+    /// A cache for functions which are known to call or not call randomness features
+    randomness_caller_cache: BTreeMap<QualifiedId<FunId>, bool>,
 }
 
 impl<'a> ExtendedChecker<'a> {
@@ -106,6 +112,7 @@ impl<'a> ExtendedChecker<'a> {
                 AccountAddress::ONE,
                 Identifier::new("error").unwrap(),
             ),
+            randomness_caller_cache: BTreeMap::new(),
         }
     }
 
@@ -117,6 +124,7 @@ impl<'a> ExtendedChecker<'a> {
                 self.check_and_record_view_functions(module);
                 self.check_entry_functions(module);
                 self.check_and_record_unbiasabale_entry_functions(module);
+                self.check_unsafe_randomness_usage(module);
                 self.check_and_record_events(module);
                 self.check_init_module(module);
                 self.build_error_map(module)
@@ -485,6 +493,77 @@ impl<'a> ExtendedChecker<'a> {
 }
 
 // ----------------------------------------------------------------------------------
+// Checks for unsafe usage of randomness
+
+impl<'a> ExtendedChecker<'a> {
+    /// Checks unsafe usage of the randomness feature for the given module.
+    ///
+    /// - Checks that no public function in the module calls randomness features. An
+    ///   attribute can be used to override this check.
+    /// - TODO: Should(?) also check that every private entry function which uses randomness
+    ///   features has the #[randomness] attribute
+    /// - TODO: check that whenever a dynamic dispatch handler is installed, the passed function
+    ///   does not call randomness features.
+    fn check_unsafe_randomness_usage(&mut self, module: &ModuleEnv) {
+        for ref fun in module.get_functions() {
+            // Only check public function, and only if the check is not disabled.
+            // Also, only check functions which are not declared in the framework.
+            let fun_id = fun.module_env.get_id().qualified(fun.get_id());
+            if self.is_framework_function(fun_id)
+                || !fun.visibility().is_public()
+                || self.has_attribute(fun, ALLOW_UNSAFE_RANDOMNESS_ATTRIBUTE)
+            {
+                continue;
+            }
+            if self.calls_randomness(fun_id) {
+                self.env.error(
+                    &fun.get_loc(),
+                    "public function exposes functionality of the `randomness` module \
+                    which can be unsafe. Consult the randomness documentation for an explanation \
+                    of this error. To skip this check, add \
+                    attribute `#[lint_allow_unsafe_randomness]`",
+                )
+            }
+        }
+    }
+
+    /// Checks whether given function calls random functionality. This walks the call graph
+    /// recursively and stops as soon as a random call is found.
+    fn calls_randomness(&mut self, fun: QualifiedId<FunId>) -> bool {
+        if let Some(is_caller) = self.randomness_caller_cache.get(&fun) {
+            return *is_caller;
+        }
+        // For building a fixpoint on cycles, set the value initially to false
+        self.randomness_caller_cache.insert(fun, false);
+        let mut is_caller = false;
+        for callee in self
+            .env
+            .get_function(fun)
+            .get_called_functions()
+            .expect("callees defined")
+        {
+            if self.is_randomness_fun(*callee) || self.calls_randomness(*callee) {
+                is_caller = true;
+                break;
+            }
+        }
+        if is_caller {
+            // If we found a randomness call, update the cache
+            self.randomness_caller_cache.insert(fun, true);
+        }
+        is_caller
+    }
+
+    /// Check whether function belongs to the randomness feature. This is done by
+    /// checking the well-known module name.
+    fn is_randomness_fun(&self, fun: QualifiedId<FunId>) -> bool {
+        let module_name = self.env.get_function(fun).module_env.get_name().clone();
+        module_name.addr().expect_numerical() == AccountAddress::ONE
+            && &*self.env.symbol_pool().string(module_name.name()) == RANDOMNESS_MODULE_NAME
+    }
+}
+
+// ----------------------------------------------------------------------------------
 // View Functions
 
 impl<'a> ExtendedChecker<'a> {
@@ -702,6 +781,16 @@ impl<'a> ExtendedChecker<'a> {
     fn is_function(&self, id: QualifiedId<FunId>, full_name_str: &str) -> bool {
         let fun = &self.env.get_function(id);
         fun.get_full_name_with_address() == full_name_str
+    }
+
+    fn is_framework_function(&self, id: QualifiedId<FunId>) -> bool {
+        self.env
+            .get_function(id)
+            .module_env
+            .get_name()
+            .addr()
+            .expect_numerical()
+            == AccountAddress::ONE
     }
 }
 
