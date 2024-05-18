@@ -1156,15 +1156,6 @@ impl FakeExecutor {
             gas_feature_version,
         ) = get_gas_parameters(&features, state_view);
 
-        let gas_params = gas_params_res.unwrap();
-        let mut gas_meter = make_prod_gas_meter(
-            gas_feature_version,
-            gas_params.clone().vm,
-            storage_gas_params.unwrap(),
-            false,
-            10000000000000.into(),
-        );
-
         let timed_features = TimedFeaturesBuilder::enable_all()
             .with_override_profile(TimedFeatureOverride::Testing)
             .build();
@@ -1192,20 +1183,21 @@ impl FakeExecutor {
         )?;
         let storage = TraversalStorage::new();
         if gas_params_res.is_ok() && storage_gas_params.is_ok() {
+            let gas_params = gas_params_res.unwrap();
+            let mut gas_meter = make_prod_gas_meter(
+                gas_feature_version,
+                gas_params.clone().vm,
+                storage_gas_params.unwrap(),
+                false,
+                100_000_000.into(),
+            );
             session
                 .execute_entry_function(
                     entry_fn.module(),
                     entry_fn.function(),
                     entry_fn.ty_args().to_vec(),
                     args,
-                    &mut MemoryTrackedGasMeter::new(StandardGasMeter::new(
-                        StandardGasAlgebra::new(
-                            gas_feature_version,
-                            gas_params_res.unwrap().clone().vm,
-                            storage_gas_params.unwrap(),
-                            100000000,
-                        ),
-                    )),
+                    &mut gas_meter,
                     &mut TraversalContext::new(&storage),
                 )
                 .map_err(|e| e.into_vm_status())?;
