@@ -60,12 +60,13 @@ use aptos_config::config::{
     SafetyRulesConfig, SecureBackend,
 };
 use aptos_consensus_types::{
+    block::Block,
     common::{Author, Round},
     delayed_qc_msg::DelayedQcMsg,
     epoch_retrieval::EpochRetrievalRequest,
     proof_of_store::ProofCache,
 };
-use aptos_crypto::bls12381;
+use aptos_crypto::{bls12381, HashValue};
 use aptos_dkg::{
     pvss::{traits::Transcript, Player},
     weighted_vuf::traits::WeightedVUF,
@@ -105,10 +106,11 @@ use futures::{
 };
 use itertools::Itertools;
 use mini_moka::sync::Cache;
+use once_cell::sync::Lazy;
 use rand::{prelude::StdRng, thread_rng, SeedableRng};
 use std::{
     cmp::Ordering,
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     hash::Hash,
     mem::{discriminant, Discriminant},
     sync::Arc,
@@ -127,6 +129,56 @@ pub enum LivenessStorageData {
     FullRecoveryData(RecoveryData),
     PartialRecoveryData(LedgerRecoveryData),
 }
+
+pub struct PendingBlocks {
+    blocks_by_hash: HashMap<HashValue, Block>,
+    blocks_by_round: BTreeMap<Round, Block>,
+    pending_request: Option<(HashValue, oneshot::Sender<Block>)>,
+}
+
+impl PendingBlocks {
+    pub fn insert_block(&mut self, block: Block) {
+        self.blocks_by_hash.insert(block.id(), block.clone());
+        self.blocks_by_round.insert(block.round(), block.clone());
+        if let Some((id, tx)) = self.pending_request.take() {
+            if id == block.id() {
+                info!("FulFill block request from incoming block: {}", id);
+                tx.send(block).ok();
+            } else {
+                self.pending_request = Some((id, tx));
+            }
+        }
+    }
+
+    pub fn insert_request(&mut self, block_id: HashValue, sender: oneshot::Sender<Block>) {
+        if let Some(block) = self.blocks_by_hash.get(&block_id) {
+            info!("FulFill block request from existing buffer: {}", block_id);
+            sender.send(block.clone()).ok();
+            return;
+        }
+        self.pending_request = Some((block_id, sender));
+    }
+
+    pub fn gc(&mut self, round: Round) {
+        let mut to_remove = vec![];
+        for (r, _) in self.blocks_by_round.range(..=round) {
+            to_remove.push(*r);
+        }
+        for r in to_remove {
+            if let Some(block) = self.blocks_by_round.remove(&r) {
+                self.blocks_by_hash.remove(&block.id());
+            }
+        }
+    }
+}
+
+pub(crate) static PENDING_BLOCKS: Lazy<std::sync::Mutex<PendingBlocks>> = Lazy::new(|| {
+    std::sync::Mutex::new(PendingBlocks {
+        blocks_by_hash: HashMap::new(),
+        blocks_by_round: BTreeMap::new(),
+        pending_request: None,
+    })
+});
 
 // Manager the components that shared across epoch and spawn per-epoch RoundManager with
 // epoch-specific input.
@@ -1559,7 +1611,12 @@ impl<P: OnChainConfigProvider> EpochManager<P> {
                         payload_manager
                             .prefetch_payload_data(payload, p.proposal().timestamp_usecs());
                     }
+                    PENDING_BLOCKS
+                        .lock()
+                        .unwrap()
+                        .insert_block(p.proposal().clone());
                 }
+
                 Self::forward_event_to(buffered_proposal_tx, peer_id, proposal_event)
                     .context("proposal precheck sender")
             },
